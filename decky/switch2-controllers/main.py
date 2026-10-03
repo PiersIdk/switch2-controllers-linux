@@ -11,7 +11,12 @@ try:
 except ImportError:
     decky = None  # type: ignore
 
-PROJECT_DIR = os.environ.get("NGC_PROJECT_DIR", os.path.expanduser("~/nso-gc-bazzite"))
+# Patched to an absolute path by install-decky.sh when copied out of the repo
+# checkout into Decky's plugins dir; NGC_PROJECT_DIR always wins if set.
+_BAKED_PROJECT_DIR: str | None = None
+PROJECT_DIR = os.environ.get("NGC_PROJECT_DIR") or _BAKED_PROJECT_DIR or os.path.expanduser(
+    "~/switch2-controllers-linux"
+)
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 

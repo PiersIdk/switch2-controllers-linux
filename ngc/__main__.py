@@ -3,6 +3,8 @@
     python -m ngc pair     # scan for a controller in pairing mode, save its address
     python -m ngc run      # run the bridge (virtual gamepad + auto-reconnect)
     python -m ngc          # run; if unconfigured, pair first
+    python -m ngc joycons split|join   # separate / rejoin a connected Joy-Con pair
+    python -m ngc headset on|off|toggle|status   # Pro Controller 2 headset mode
 """
 
 from __future__ import annotations
@@ -153,6 +155,40 @@ def _swap(cfg: Config, player_a: int, player_b: int) -> int:
     return 0
 
 
+def _joycons(action: str | None) -> int:
+    """Ask the running bridge to split or rejoin the Joy-Con pair. The bridge
+    owns the links, so this just leaves a request it picks up within ~1.5 s
+    (see Bridge._check_joycon_request)."""
+    from .bridge import JOYCON_REQUEST_PATH
+
+    if action not in ("split", "join"):
+        print("Usage: ngc joycons split|join")
+        return 1
+    JOYCON_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    JOYCON_REQUEST_PATH.write_text(action)
+    print(f"Requested Joy-Con {action}.")
+    return 0
+
+
+def _headset(cfg: Config, action: str | None) -> int:
+    """Pro Controller 2 headset mode: the headset in its 3.5 mm jack becomes a
+    microphone, but motion and battery aren't decoded while it's on."""
+    from .bridge import HEADSET_REQUEST_PATH
+
+    current = cfg.pro2_headset_mic
+    if action in (None, "status"):
+        print(f"Headset mode is {'on' if current else 'off'}.")
+        return 0
+    if action not in ("on", "off", "toggle"):
+        print("Usage: ngc headset on|off|toggle|status")
+        return 1
+    want = (not current) if action == "toggle" else (action == "on")
+    HEADSET_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    HEADSET_REQUEST_PATH.write_text("on" if want else "off")
+    print(f"Headset mode {'on (mic on, motion off)' if want else 'off (motion on)'}.")
+    return 0
+
+
 def _run(cfg: Config) -> int:
     from .bridge import Bridge
 
@@ -178,7 +214,9 @@ def _run(cfg: Config) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ngc", description="Switch 2 controller bridge (GameCube / Pro Controller 2 / Joy-Con 2)")
     parser.add_argument("command", nargs="?", default="run",
-                        choices=["run", "pair", "rebond", "list", "remove", "swap"])
+                        choices=["run", "pair", "rebond", "list", "remove", "swap", "joycons", "headset"])
+    parser.add_argument("action", nargs="?", choices=["split", "join", "on", "off", "toggle", "status"],
+                        help="joycons: split|join; headset: on|off|toggle|status")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--timeout", type=float, default=30.0, help="pairing scan timeout")
     parser.add_argument("--mac", help="controller MAC (for remove)")
@@ -207,6 +245,12 @@ def main(argv=None) -> int:
 
     if args.command == "list":
         return _list(cfg)
+
+    if args.command == "joycons":
+        return _joycons(args.action)
+
+    if args.command == "headset":
+        return _headset(cfg, args.action)
 
     if not cfg.entries():
         print("No controller configured; scanning for one in pairing mode first.")

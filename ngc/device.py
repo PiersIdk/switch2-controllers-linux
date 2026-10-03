@@ -20,6 +20,7 @@ from typing import Callable, Optional
 
 from . import att
 from . import protocol as P
+from .imu_bias import GyroBias
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,13 @@ DEFAULT_HANDLE_COMMAND_RESPONSE = 0x001A
 DEFAULT_HANDLE_COMMAND_RESPONSE_CCCD = 0x001B
 
 InputCallback = Callable[["SwitchController", P.InputReport], None]
+
+# GATT layout is static per physical controller for the life of its firmware,
+# and re-walking it (discover_all) is the slowest part of the post-connect
+# handshake. Cache it by MAC so reconnects within this process (sleep/wake,
+# idle-scan re-pair) skip discovery; initialize() re-discovers automatically
+# if a cached handle ever turns out stale.
+_HANDLE_CACHE: dict[str, dict[str, "att.Characteristic"]] = {}
 
 
 class SwitchController:
@@ -74,6 +82,13 @@ class SwitchController:
         self.last_button_at: float = 0.0
         self._last_buttons: int = 0
 
+        self.gyro_bias = GyroBias(mac)
+        # Headset mode (Pro Controller 2): set want_extended before initialize()
+        # to switch to the extended reports; mic_callback gets each raw one.
+        self.want_extended = False
+        self.extended = False
+        self.mic_callback: Optional[Callable[[bytes], None]] = None
+
         self.att.notification_cb = self._on_notification
         self.att.disconnect_cb = self._on_disconnect
 
@@ -114,21 +129,25 @@ class SwitchController:
     def is_connected(self) -> bool:
         return self.att.is_connected
 
-    def _resolve_handles(self) -> None:
+    def _resolve_handles(self, *, use_cache: bool = True) -> None:
         """Discover the GATT table and map the characteristics we use by UUID.
 
         Keeps the GameCube defaults if a characteristic is missing so a partial
-        discovery never makes things worse."""
-        try:
-            services = self.att.discover_all()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("GATT discovery failed (%s); using default handles", exc)
-            return
+        discovery never makes things worse. Reuses a cached table from a prior
+        connection to this MAC (see _HANDLE_CACHE) unless use_cache=False."""
+        by_uuid = _HANDLE_CACHE.get(self.mac) if use_cache else None
+        if by_uuid is None:
+            try:
+                services = self.att.discover_all()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("GATT discovery failed (%s); using default handles", exc)
+                return
 
-        by_uuid: dict[str, att.Characteristic] = {}
-        for svc in services:
-            for ch in svc.characteristics:
-                by_uuid[ch.uuid] = ch
+            by_uuid = {}
+            for svc in services:
+                for ch in svc.characteristics:
+                    by_uuid[ch.uuid] = ch
+            _HANDLE_CACHE[self.mac] = by_uuid
 
         def val(uuid: str, default: int) -> int:
             ch = by_uuid.get(uuid)
@@ -157,6 +176,33 @@ class SwitchController:
             self.h_vibration = ch.value_handle
         logger.debug("vibration handle=%#06x (uuid %s)", self.h_vibration, uuid)
 
+    def set_headset_mode(self, on: bool) -> bool:
+        """Switch a connected Pro Controller 2 between the normal input reports
+        and the extended (headset-mic) ones without reconnecting. Returns
+        False if this controller can't (not a Pro 2, or handles unknown)."""
+        by_uuid = getattr(self, "_by_uuid", {})
+        ext = by_uuid.get(P.EXTENDED_INPUT_UUID)
+        normal = by_uuid.get(P.INPUT_REPORT_UUID)
+        if self.product_id != P.PRO_CONTROLLER2_PID or ext is None or normal is None:
+            return False
+        if on == self.extended:
+            return True
+        if on:
+            self.att.subscribe(ext.cccd_handle, True)
+            self.h_input, self.h_input_cccd = ext.value_handle, ext.cccd_handle
+            self.extended = True
+            self.enable_features(0xFF)
+            self.att.subscribe(normal.cccd_handle, False)
+        else:
+            self.att.subscribe(normal.cccd_handle, True)
+            self.att.subscribe(ext.cccd_handle, False)
+            self.enable_features(0x03 | P.FEATURE_MOTION)
+            self.h_input, self.h_input_cccd = normal.value_handle, normal.cccd_handle
+            self.extended = False
+        self.last_input_at = 0.0  # so callers can see the new stream arrive
+        logger.info("headset mode %s", "on (mic on, motion off)" if on else "off")
+        return True
+
     def enable_commands(self) -> None:
         """Subscribe to the command-response characteristic so write_command
         can correlate replies. Required before any command."""
@@ -164,8 +210,17 @@ class SwitchController:
 
     def initialize(self, player: int = 1) -> None:
         """Run the full handshake after a successful connect."""
+        used_cache = self.mac in _HANDLE_CACHE
         self._resolve_handles()
-        self._retry("enable commands", self.enable_commands)
+        try:
+            self._retry("enable commands", self.enable_commands)
+        except RuntimeError:
+            if not used_cache:
+                raise
+            logger.warning("cached GATT handles for %s look stale; re-discovering", self.mac)
+            _HANDLE_CACHE.pop(self.mac, None)
+            self._resolve_handles(use_cache=False)
+            self._retry("enable commands", self.enable_commands)
 
         self.info = self._retry("read info", self.read_controller_info)
         logger.info("identified %s serial=%s", self.info.name, self.info.serial_number)
@@ -175,7 +230,19 @@ class SwitchController:
 
         self._retry("player LEDs", lambda: self.set_player_leds(player))
         self._retry("vibration test", lambda: self.play_vibration_preset(P.GC_VIBRATION_PRESET_SOFT))
-        self._retry("enable features", lambda: self.enable_features(0x03 | P.FEATURE_MOTION))
+        features = 0x03 | P.FEATURE_MOTION
+        if P.is_joycon(self.product_id):
+            # Optical sensor: motion counters + on-surface flag (see mouse.py).
+            features |= P.FEATURE_MOUSE
+        ext = getattr(self, "_by_uuid", {}).get(P.EXTENDED_INPUT_UUID)
+        if self.want_extended and self.product_id == P.PRO_CONTROLLER2_PID and ext is not None:
+            # Headset mode: every feature bit switches input to the 112-byte
+            # reports that carry the 3.5 mm headset mic (P.parse_extended_report).
+            features = 0xFF
+            self.h_input, self.h_input_cccd = ext.value_handle, ext.cccd_handle
+            self.extended = True
+            logger.info("headset mode: extended input reports (mic on, motion off)")
+        self._retry("enable features", lambda: self.enable_features(features))
 
         if self.has_hd_rumble:
             self._start_hd_worker()
@@ -204,18 +271,42 @@ class SwitchController:
 
     def _on_notification(self, handle: int, data: bytes) -> None:
         if handle == self.h_input:
-            report = P.InputReport.parse(data)
+            if self.extended:
+                report = P.parse_extended_report(data)
+                if self.mic_callback is not None:
+                    self.mic_callback(data)
+            else:
+                report = P.InputReport.parse(data)
+            if not self.extended:  # no motion decoded in headset mode
+                report.gyro = self.gyro_bias.correct(report.accel, report.gyro)
             self.battery_mv = report.battery_mv
             now = time.monotonic()
             self.last_input_at = now
             if report.buttons != self._last_buttons:
                 self._last_buttons = report.buttons
                 self.last_button_at = now
+            elif self._stick_deflected(report):
+                # A stick held off-centre is use too (e.g. steering with only
+                # the left stick); without this the idle timer sleeps the pad.
+                self.last_button_at = now
             if self.input_callback is not None:
                 self.input_callback(self, report)
         elif handle == self.h_cmd_resp:
             self._cmd_response = data
             self._cmd_event.set()
+
+    # Calibrated deflection that counts as the stick being used. Resting drift
+    # in the captures stayed under ~0.05.
+    STICK_ACTIVITY_THRESHOLD = 0.25
+
+    def _stick_deflected(self, report: P.InputReport) -> bool:
+        for calib, raw in ((self.left_calib, report.left_stick_raw),
+                           (self.right_calib, report.right_stick_raw)):
+            if calib is not None:
+                x, y = calib.apply(raw)
+                if max(abs(x), abs(y)) >= self.STICK_ACTIVITY_THRESHOLD:
+                    return True
+        return False
 
     def _on_disconnect(self) -> None:
         self._hd_run = False
@@ -253,8 +344,17 @@ class SwitchController:
         return P.ControllerInfo.from_bytes(self.read_memory(0x40, P.ADDRESS_CONTROLLER_INFO))
 
     def _read_calibration(self) -> None:
-        self.left_calib = self._read_stick(P.CALIBRATION_USER_JOYSTICK_1, P.CALIBRATION_JOYSTICK_1)
-        self.right_calib = self._read_stick(P.CALIBRATION_USER_JOYSTICK_2, P.CALIBRATION_JOYSTICK_2)
+        primary = self._read_stick(P.CALIBRATION_USER_JOYSTICK_1, P.CALIBRATION_JOYSTICK_1)
+        if self.product_id == P.JOYCON2_RIGHT_PID:
+            # A Joy-Con's one stick is calibrated in slot 1 whichever side it
+            # is (slot 2 reads all-FF), but the Right one reports it in the
+            # right-stick bytes. The unused stick gets no calibration -> 0.
+            self.left_calib, self.right_calib = None, primary
+        elif self.product_id == P.JOYCON2_LEFT_PID:
+            self.left_calib, self.right_calib = primary, None
+        else:
+            self.left_calib = primary
+            self.right_calib = self._read_stick(P.CALIBRATION_USER_JOYSTICK_2, P.CALIBRATION_JOYSTICK_2)
         if self.has_analog_triggers:
             try:
                 cal = self.read_memory(0x02, P.CALIBRATION_GC_TRIGGERS)
@@ -356,13 +456,19 @@ class SwitchController:
         mag = min(1.0, strong + weak * 0.5)
         return P.VibrationData(lf_freq=cls.HD_LF_FREQ, lf_amp=int(mag * 0x3FF))
 
+    # Joy-Con 2 actuators are much smaller than the Pro's: at the Pro tuning a
+    # strong effect rattles the shoulder buttons, so scale them down.
+    JOYCON_HD_GAIN = 0.45
+
     def _hd_loop(self) -> None:
         """Continuously drive the HD motor while a force-feedback effect is
         active. Re-sends at ~60 Hz (matching the console) so the rumble sustains
         smoothly; idles on an event when there is nothing to play."""
         active = False
+        gain = self.JOYCON_HD_GAIN if P.is_joycon(self.product_id) else 1.0
         while self._hd_run:
             strong, weak = self._hd_target
+            strong, weak = strong * gain, weak * gain
             if strong <= 0.001 and weak <= 0.001:
                 if active:
                     try:
@@ -375,8 +481,11 @@ class SwitchController:
                 continue
             try:
                 self._write_motor(self._hd_waveform(strong, weak))
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Retried at 60 Hz, so only say so once per session.
+                if not getattr(self, "_hd_warned", False):
+                    self._hd_warned = True
+                    logger.warning("HD rumble write failed for %s: %s", self.mac, exc)
             active = True
             time.sleep(0.016)
 

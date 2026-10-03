@@ -6,8 +6,8 @@ Wants=bluetooth.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/nso-gc-bazzite
-ExecStart=%h/nso-gc-bazzite/.venv312/bin/python -m ngc run
+WorkingDirectory=@PROJECT_DIR@
+ExecStart=@PROJECT_DIR@/.venv312/bin/python -m ngc run
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0

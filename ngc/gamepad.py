@@ -36,7 +36,11 @@ TRIGGER_MIN, TRIGGER_MAX = 0, 255
 # Switch-style layouts, ZL+ L -> BTN_TL (left bumper) and Z+ R click -> BTN_TR
 # (right bumper). C -> BTN_SELECT (minus). Analog L/R stay on trigger axes.      #
 #                                                                             #
-# Face buttons use semantic evdev positions (A=SOUTH, B=EAST, X=WEST, Y=NORTH).
+# Pro / Joy-Con face buttons go where they sit on a Nintendo pad: A (right) =
+# EAST, B (bottom) = SOUTH. Steam / SDL label a Nintendo VID's buttons by
+# position, so the old label-based A=SOUTH / B=EAST showed A and B swapped
+# (confirmed in Steam on both the Joy-Con pair and the Pro Controller 2).
+# X=WEST / Y=NORTH were already right there.
 # BTN_C (306) sits between B and the face cluster, so SDL's auto gamecontrollerdb
 # assigns x:b3/y:b4 to the wrong indices — install-emulator-integration.sh writes
 # a corrected mapping for Steam. Dolphin uses WEST/NORTH tokens directly.
@@ -46,8 +50,8 @@ TRIGGER_MIN, TRIGGER_MAX = 0, 255
 # --------------------------------------------------------------------------- #
 
 PRO_BUTTON_MAP = {
-    "A": e.BTN_SOUTH,
-    "B": e.BTN_EAST,
+    "A": e.BTN_EAST,
+    "B": e.BTN_SOUTH,
     "X": e.BTN_WEST,
     "Y": e.BTN_NORTH,
     "L": e.BTN_TL,
@@ -82,6 +86,9 @@ GAMECUBE_BUTTON_MAP = {
     "R_STK": e.BTN_THUMBR,
 }
 
+# The Joy-Con pair (and lone Joy-Cons, via their sideways remap) share it.
+JOYCON_PAIR_BUTTON_MAP = PRO_BUTTON_MAP
+
 DEFAULT_BUTTON_MAP = PRO_BUTTON_MAP
 
 
@@ -99,6 +106,7 @@ class SwitchGamepad:
         button_map=None,
         product: int = P.NSO_GAMECUBE_PID,
         mac: str = "",
+        version: int = 0x0100,
     ):
         self.button_map = button_map or DEFAULT_BUTTON_MAP
         keys = sorted(set(self.button_map.values()))
@@ -124,7 +132,9 @@ class SwitchGamepad:
             name=name,
             vendor=P.NINTENDO_VENDOR_ID,
             product=product,
-            version=0x0100,
+            # Part of the SDL GUID Steam saves names and bindings under, so
+            # pads sharing a product ID need distinct versions to be told apart.
+            version=version,
             bustype=e.BUS_BLUETOOTH,
             phys=phys,
         )
@@ -135,6 +145,7 @@ class SwitchGamepad:
 
         self.rumble_cb: Optional[Callable[[float, float], None]] = None
         self._effects: dict[int, tuple[int, int]] = {}
+        self._ff_seen = False
         self._ff_running = True
         self._ff_thread = threading.Thread(target=self._ff_loop, daemon=True)
         self._ff_thread.start()
@@ -231,6 +242,8 @@ class SwitchGamepad:
         if etype == e.EV_UINPUT and code == e.UI_FF_UPLOAD:
             upload = self.ui.begin_upload(value)
             effect = upload.effect
+            if not self._ff_seen:
+                logger.info("rumble effect uploaded on %s (type %s)", self.ui.name, effect.type)
             if effect.type == e.FF_RUMBLE:
                 r = effect.u.ff_rumble_effect
                 self._effects[effect.id] = (r.strong_magnitude, r.weak_magnitude)
@@ -242,6 +255,12 @@ class SwitchGamepad:
             erase.retval = 0
             self.ui.end_erase(erase)
         elif etype == e.EV_FF:
+            if value and not self._ff_seen:
+                # Once per pad: the quickest way to tell "nothing asked for
+                # rumble" apart from "rumble was asked for but went nowhere".
+                self._ff_seen = True
+                logger.info("rumble requested on %s (forwarding=%s)",
+                            self.ui.name, self.rumble_cb is not None)
             if self.rumble_cb is None:
                 return
             if value == 0:

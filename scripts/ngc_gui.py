@@ -22,7 +22,7 @@ except ImportError as exc:
     print(f"GTK unavailable: {exc}", file=sys.stderr)
     sys.exit(2)
 
-PROJECT_DIR = Path(os.environ.get("NGC_PROJECT_DIR", Path.home() / "nso-gc-bazzite"))
+PROJECT_DIR = Path(os.environ.get("NGC_PROJECT_DIR", str(Path(__file__).resolve().parent.parent)))
 PY = Path(os.environ.get("NGC_PYTHON", PROJECT_DIR / ".venv312" / "bin" / "python"))
 SERVICE = "nso-gc.service"
 STATE_PATH = Path.home() / ".config" / "nso-gc" / "state.json"
@@ -947,7 +947,7 @@ class MainWindow(Gtk.ApplicationWindow):
 def main() -> int:
     ensure_display_env()
     if not ensure_installed():
-        print("Install failed — run: bash ~/nso-gc-bazzite/scripts/install.sh", file=sys.stderr)
+        print(f"Install failed — run: bash {PROJECT_DIR}/scripts/install.sh", file=sys.stderr)
         return 1
     ensure_service()
     app = SwitchControllersApp()

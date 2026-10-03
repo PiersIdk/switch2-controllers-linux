@@ -2,7 +2,7 @@
 # Shared helpers for Desktop-friendly ngc launchers (zenity / kdialog).
 set -euo pipefail
 
-PROJECT_DIR="${NGC_PROJECT_DIR:-$HOME/nso-gc-bazzite}"
+PROJECT_DIR="${NGC_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PY="${NGC_PYTHON:-$PROJECT_DIR/.venv312/bin/python}"
 SERVICE="nso-gc.service"
 

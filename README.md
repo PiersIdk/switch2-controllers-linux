@@ -89,8 +89,8 @@ Key design choices:
 ## Install
 
 ```bash
-git clone https://github.com/trevlars/switch2-controllers-linux.git ~/nso-gc-bazzite
-cd ~/nso-gc-bazzite
+git clone https://github.com/trevlars/switch2-controllers-linux.git ~/switch2-controllers-linux
+cd ~/switch2-controllers-linux
 bash scripts/install.sh
 ```
 

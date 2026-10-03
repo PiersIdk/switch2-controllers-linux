@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-PROJECT_DIR = Path(os.environ.get("NGC_PROJECT_DIR", Path.home() / "nso-gc-bazzite"))
+PROJECT_DIR = Path(os.environ.get("NGC_PROJECT_DIR", str(Path(__file__).resolve().parent.parent)))
 PY = Path(os.environ.get("NGC_PYTHON", PROJECT_DIR / ".venv312" / "bin" / "python"))
 SERVICE = "nso-gc.service"
 STATE_PATH = Path.home() / ".config" / "nso-gc" / "state.json"

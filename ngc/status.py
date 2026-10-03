@@ -35,6 +35,10 @@ class BridgeState:
     headline: str = ""
     detail: str = ""
     controllers: list[ControllerState] = field(default_factory=list)
+    # Connected Joy-Cons are separate controllers rather than one pair
+    # (see Bridge.set_joycon_split), and how many Joy-Cons are connected.
+    joycons_split: bool = False
+    joycons_connected: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -54,6 +58,8 @@ class BridgeState:
             headline=str(data.get("headline") or ""),
             detail=str(data.get("detail") or ""),
             controllers=controllers,
+            joycons_split=bool(data.get("joycons_split")),
+            joycons_connected=int(data.get("joycons_connected") or 0),
         )
 
 

@@ -29,12 +29,19 @@ from . import protocol as P
 from .config import CONFIG_DIR, Config, ControllerEntry
 from .device import SwitchController
 from .dsu import DSUServer
-from .gamepad import SwitchGamepad
+from .gamepad import JOYCON_PAIR_BUTTON_MAP, SwitchGamepad
+from .imu_frame import to_dsu, upright
+from .joycon import JoyConPair
 from .motion_evdev import MotionEvdev
 from .status import BridgeState, ControllerState, clear_state, write_state
 
 # Written by system/bazzite-set-player-leds.py when emulator player order changes.
 _LED_PLAYERS_PATH = CONFIG_DIR / "led-players.json"
+# "split" / "join", written by `python -m ngc joycons ...` (e.g. from the TV
+# launcher) and consumed by the running bridge within one status interval.
+JOYCON_REQUEST_PATH = CONFIG_DIR / "joycon-request"
+# "on" / "off", written by `python -m ngc headset ...`; same pickup.
+HEADSET_REQUEST_PATH = CONFIG_DIR / "headset-request"
 
 
 def _stick_to_dsu(value: float) -> int:
@@ -50,13 +57,25 @@ _SCAN_SETTLE_S = 0.10
 # Per-attempt L2CAP connect wait. Short windows fail when Steam keeps LE scan
 # busy; after btmgmt stop-find -l a few hundred ms is enough.
 _CONNECT_ATTEMPT_S = 0.80
-_CONNECT_ATTEMPTS = 16
+# ~10s of dialing per sighting. Was 16 (~30s), which kept the hub blocked
+# on a controller that had already gone back to sleep; a fresh advert
+# triggers a new round anyway.
+_CONNECT_ATTEMPTS = 6
 # Pairing-mode adverts are brief; wake adverts repeat often. A short TTL caused
 # missed connects when Sync was held or the 0.25s scan window slipped.
 _SEEN_TTL_WAKE_S = 4.0
 _SEEN_TTL_PAIRING_S = 45.0
 # Recreate BleakScanner if we stay disconnected despite recent adverts.
 _HUB_IDLE_RESTART_CYCLES = 80  # ~20s at default scan cadence
+# A disconnected controller's virtual pad is kept this long (so a brief link
+# drop doesn't make a game lose it), then removed - like a real Bluetooth pad
+# disappearing when it sleeps. Kept forever, a sleeping pad's device stayed
+# listed ahead of the one in use and apps that pick "the latest" controller
+# (the TV launcher's glyphs and evdev reader) latched onto the stale one.
+PAD_REMOVE_GRACE_S = 15.0
+# Pause between scan bursts while one Joy-Con half is linked and its partner
+# is not; keeps the radio mostly free for the live link.
+_JOYCON_PARTNER_SCAN_GAP_S = 2.0
 
 
 def _seen_ttl(mode: str) -> float:
@@ -241,6 +260,7 @@ class _ConnectHub:
         self._connect_lock: Optional[asyncio.Lock] = None
         self._last_seen: dict[str, tuple[float, str]] = {}
         self._logged: set[str] = set()
+        self._logged_foreign: set[str] = set()
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._hub_error = ""
         self._scanning = False
@@ -261,6 +281,12 @@ class _ConnectHub:
             return False
         reconnect = P.reconnect_mac_from_advertisement(adv)
         if reconnect is not None and self.host_mac is not None and reconnect not in (0, self.host_mac):
+            # Waking for another host (e.g. a console it was paired to since):
+            # only Sync reaches us until it's re-bonded (see _Worker.activate).
+            if addr not in self._logged_foreign:
+                self._logged_foreign.add(addr)
+                logger.info("%s is waking for another host (%012X); hold Sync to bring it back",
+                            addr, reconnect)
             return False
         return True
 
@@ -329,9 +355,15 @@ class _ConnectHub:
                     continue
 
                 connected_count = len(workers) - len(disconnected)
-                if connected_count:
+                joycon_half_missing = any(w.is_joycon() for w in disconnected) and any(
+                    w.is_joycon() for w in workers if w.is_connected()
+                )
+                if connected_count and not joycon_half_missing:
                     # Never scan while a pad holds a live BLE session — scanning for
                     # the other saved pad drops the connected one within seconds.
+                    # Exception below: a Joy-Con pair needs both halves linked at
+                    # once, so while one half is up and the other is missing we
+                    # scan in short, widely spaced bursts instead.
                     hub._scanning = False
                     hub._idle_scan_cycles = 0
                     await asyncio.sleep(2.0)
@@ -397,7 +429,7 @@ class _ConnectHub:
                         mode = hub._last_seen[mac][1]
                         try:
                             ok, detail = await hub._loop.run_in_executor(
-                                hub._executor, hub._connect_sync, mac
+                                hub._executor, hub._connect_sync, mac, mode == "pairing"
                             )
                         except Exception as exc:  # noqa: BLE001
                             ok, detail = False, str(exc)
@@ -407,6 +439,10 @@ class _ConnectHub:
                             hub._logged.discard(mac)
                         else:
                             logger.info("connect to %s (%s) failed (%s)", mac, mode, detail)
+                            # Forget this sighting so we only re-dial on a fresh
+                            # advert, not a stale one (pairing ones live 45s).
+                            hub._last_seen.pop(mac, None)
+                            hub._logged.discard(mac)
                             _force_le_scan_off(force=True)
 
                 for mac, (seen_at, mode) in list(hub._last_seen.items()):
@@ -433,13 +469,16 @@ class _ConnectHub:
                 else:
                     hub._idle_scan_cycles = 0
 
-                await asyncio.sleep(0.05 if connected_count else 0.025)
+                if joycon_half_missing:
+                    await asyncio.sleep(_JOYCON_PARTNER_SCAN_GAP_S)
+                else:
+                    await asyncio.sleep(0.05 if connected_count else 0.025)
         finally:
             hub._scanning = False
             if hub._scanner is not None:
                 await hub._scanner.stop()
 
-    def _connect_sync(self, mac: str) -> tuple[bool, str]:
+    def _connect_sync(self, mac: str, pairing: bool = False) -> tuple[bool, str]:
         worker = self.workers_by_mac.get(mac)
         if worker is None or worker.is_connected():
             return False, "already connected"
@@ -456,13 +495,14 @@ class _ConnectHub:
             last_detail = "no attempts"
             for attempt in range(_CONNECT_ATTEMPTS):
                 ctrl = SwitchController(mac, adapter)
+                ctrl.want_extended = self.config.pro2_headset_mic
                 ctrl.GC_IMPACT_THRESHOLD = self.config.gc_impact_threshold
                 for dst in dst_types:
                     ok, detail = self._connect_dst_with_polling(ctrl, dst, attempt_s)
                     if ok:
                         ctrl.att.dst_type = dst
                         worker.last_dst_type = dst
-                        if worker.activate(ctrl):
+                        if worker.activate(ctrl, rebond=pairing):
                             worker._ready.set()
                             return True, "ok"
                         ctrl.close()
@@ -507,9 +547,66 @@ class _Worker:
         self._ready = threading.Event()
         self._led_player: Optional[int] = None
         self.last_dst_type: Optional[int] = None
+        # Set while this Joy-Con feeds the bridge's combined L+R pad instead
+        # of owning a gamepad (see joycon.JoyConPair).
+        self.pair: Optional[JoyConPair] = None
+        # Product ID from the most recent session (kept across disconnects).
+        self.product_id: Optional[int] = None
+        # Player number held for the current session (see Bridge.claim_player).
+        self.player: Optional[int] = None
+        # When the last session ended, while its pad is still kept around.
+        self._disconnected_at: Optional[float] = None
+        # When the current session came up; orders split Joy-Cons' players.
+        self.connected_at: float = 0.0
+        # The Joy-Con pad this worker's player number was claimed for.
+        self._pair_owner: Optional[JoyConPair] = None
+        self._pad_lock = threading.Lock()
 
     def is_connected(self) -> bool:
         return self.controller is not None and self.controller.is_connected
+
+    def is_joycon(self) -> bool:
+        """True for a Joy-Con 2 entry, known from its last session or, before
+        it has ever connected here, from the name saved at pairing."""
+        if self.product_id is not None:
+            return P.is_joycon(self.product_id)
+        return "joy-con" in (self.entry.name or "").lower()
+
+    def joycon_side(self) -> Optional[str]:
+        """"left" / "right" for a Joy-Con 2 (from its last session, else the
+        name saved at pairing), None for anything else."""
+        from .joycon import LEFT, RIGHT, side_of
+        if self.product_id is not None:
+            return side_of(self.product_id)
+        name = (self.entry.name or "").lower()
+        if "joy-con" not in name:
+            return None
+        return LEFT if "left" in name else RIGHT if "right" in name else None
+
+    def _claim_player(self) -> int:
+        """Switch-style numbering: the lowest player number no other connected
+        controller holds (a Joy-Con pair counts as one). A led-players.json
+        override still wins when present."""
+        override = _led_override_for(self.entry.mac)
+        if override is not None:
+            return override
+        bridge = self.hub.bridge
+        if bridge is None:
+            return self.entry.player
+        if self.is_joycon():
+            self._pair_owner = bridge.joycon_pair_for(self.joycon_side())
+            return bridge.claim_player(self._pair_owner)
+        return bridge.claim_player(self)
+
+    def _release_player(self) -> None:
+        self.player = None
+        bridge = self.hub.bridge
+        if bridge is None:
+            return
+        bridge.release_player(self)
+        pair, self._pair_owner = self._pair_owner, None
+        if pair is not None and pair.is_empty():
+            bridge.release_player(pair)
 
     def effective_player(self) -> int:
         """Config player slot, optionally overridden by led-players.json."""
@@ -517,15 +614,26 @@ class _Worker:
         return override if override is not None else self.entry.player
 
     def _on_input(self, ctrl: SwitchController, report: P.InputReport) -> None:
+        if self.pair is not None:
+            self.pair.on_input(ctrl, report)
+            return
         (lx, ly), (rx, ry), lt, rt = ctrl.calibrated_input(report)
         if self.gamepad is not None:
             self.gamepad.update(report.buttons, (lx, ly), (rx, ry), lt, rt)
+        # The Pro 2 shares the Joy-Con 2's raw IMU frame; give emulators the
+        # same SDL / DSU frames the Joy-Cons get (see imu_frame). The
+        # GameCube pad's motion is left as it was.
+        if ctrl.product_id == P.PRO_CONTROLLER2_PID:
+            imu = upright(report)
+            dsu_imu = to_dsu(imu)
+        else:
+            imu = dsu_imu = report
         if self.motion is not None:
-            self.motion.update(report)
+            self.motion.update(imu)
         if self.dsu is not None:
             sticks = (_stick_to_dsu(lx), _stick_to_dsu(ly),
                       _stick_to_dsu(rx), _stick_to_dsu(ry))
-            self.dsu.update(self.slot, report, sticks, (lt, rt))
+            self.dsu.update(self.slot, dsu_imu, sticks, (lt, rt))
 
     def _on_disconnect(self) -> None:
         logger.warning("controller %s disconnected", self.entry.mac)
@@ -540,8 +648,38 @@ class _Worker:
         except Exception as exc:  # noqa: BLE001
             logger.debug("rumble failed: %s", exc)
 
+    def remove_stale_pad(self, now: float) -> None:
+        """Drop the kept pad once the controller has been gone past the grace
+        period (see PAD_REMOVE_GRACE_S); the next session recreates it."""
+        with self._pad_lock:
+            if (self._disconnected_at is None or self.is_connected()
+                    or now - self._disconnected_at < PAD_REMOVE_GRACE_S):
+                return
+            self._disconnected_at = None
+            if self.gamepad is not None:
+                self.gamepad.rumble_cb = None
+                self.gamepad.close()
+                self.gamepad = None
+                self._gamepad_product = None
+                logger.info("removed virtual pad for %s (gone %.0fs)", self.entry.mac, PAD_REMOVE_GRACE_S)
+            if self.motion is not None:
+                self.motion.close()
+                self.motion = None
+
     def _ensure_gamepad(self, ctrl: SwitchController) -> None:
+        with self._pad_lock:
+            self._disconnected_at = None
+            self._ensure_gamepad_locked(ctrl)
+
+    def _ensure_gamepad_locked(self, ctrl: SwitchController) -> None:
         pid = ctrl.product_id
+        bridge = self.hub.bridge
+        if P.is_joycon(pid) and bridge is not None:
+            # Normally claimed for this pad already; covers a Joy-Con whose
+            # saved name didn't identify it as one before this session.
+            bridge.release_player(self)
+            self.move_to_pair(bridge.joycon_pair_for(self.joycon_side()))
+            return
         if self.gamepad is not None and self._gamepad_product == pid:
             return
         if self.gamepad is not None:
@@ -552,7 +690,9 @@ class _Worker:
         if self.motion is not None:
             self.motion.close()
             self.motion = None
-        name = f"{ctrl.name} (P{self.entry.player})"
+        # No player number in the name: numbers follow connection order, and
+        # Steam keys per-device bindings on the name.
+        name = ctrl.name
         self.gamepad = SwitchGamepad(
             name=name,
             button_map=self.config_button_map(pid),
@@ -574,17 +714,29 @@ class _Worker:
             resolved[switch_name] = getattr(e, code) if isinstance(code, str) else code
         return resolved
 
-    def activate(self, ctrl: SwitchController) -> bool:
+    def activate(self, ctrl: SwitchController, rebond: bool = False) -> bool:
+        """Run the handshake and bring the session up. ``rebond`` is set when
+        the controller reached us in pairing mode (Sync held): its stored host
+        may no longer be us, so write the bond again or button-press wake
+        keeps going to whatever host it holds instead."""
         mac = self.entry.mac
         try:
             logger.info("connected to %s (MTU %d)", mac, ctrl.att.mtu)
             ctrl.input_callback = self._on_input
             ctrl.disconnect_callback = self._on_disconnect
             self._disconnected.clear()
-            player = self.effective_player()
+            player = self._claim_player()
+            self.player = player
+            self.slot = max(0, min(3, player - 1))
             ctrl.initialize(player=player)
             self._led_player = player
-            if not self.entry.bonded:
+            self.product_id = ctrl.product_id
+            if ctrl.extended and self.hub.bridge is not None:
+                mic = self.hub.bridge.headset_mic_for(self.entry.mac)
+                if mic is not None:
+                    ctrl.mic_callback = mic.feed
+            self.connected_at = time.monotonic()
+            if rebond or not self.entry.bonded:
                 ctrl.bond()
                 self.config.mark_bonded(mac, True)
                 self.config.save()
@@ -594,7 +746,7 @@ class _Worker:
             self._ensure_gamepad(ctrl)
             if self.gamepad is not None and self.config.enable_rumble:
                 self.gamepad.rumble_cb = self._on_rumble
-            if self.dsu is not None:
+            if self.dsu is not None and self.pair is None:
                 self.dsu.set_slot(self.slot, True, mac=mac, battery_mv=ctrl.battery_mv or 0)
             if self.on_topology_change is not None:
                 self.on_topology_change()
@@ -606,7 +758,29 @@ class _Worker:
             self._teardown_partial(ctrl)
             return False
 
+    def move_to_pair(self, pair: JoyConPair, relayout: bool = True) -> None:
+        """Feed this Joy-Con into ``pair`` under that pad's player number."""
+        ctrl = self.controller
+        if ctrl is None:
+            return
+        bridge = self.hub.bridge
+        player = bridge.claim_player(pair) if bridge is not None else pair.player
+        self._pair_owner = pair
+        self.player = player
+        if self._led_player != player:
+            ctrl.set_player_leds(player)
+            self._led_player = player
+        pair.attach(ctrl, relayout=relayout)
+        self.pair = pair
+
+    def _detach_pair(self, ctrl: Optional[SwitchController]) -> None:
+        if self.pair is not None and ctrl is not None:
+            self.pair.detach(ctrl)
+        self.pair = None
+
     def _teardown_partial(self, ctrl: Optional[SwitchController] = None) -> None:
+        self._detach_pair(ctrl)
+        self._release_player()
         if ctrl is not None:
             try:
                 ctrl.close()
@@ -622,6 +796,8 @@ class _Worker:
             self.motion = None
 
     def _teardown_session(self, *, full: bool = False) -> None:
+        paired = self.pair is not None
+        self._detach_pair(self.controller)
         if self.gamepad is not None:
             self.gamepad.rumble_cb = None
             if full:
@@ -630,15 +806,19 @@ class _Worker:
                 self._gamepad_product = None
             else:
                 self.gamepad.release_all()
+                self._disconnected_at = time.monotonic()
         if self.motion is not None:
             if full:
                 self.motion.close()
                 self.motion = None
-        if self.dsu is not None:
+        if self.dsu is not None and not paired:
             self.dsu.set_slot(self.slot, False)
         if self.controller:
             self.controller.close()
             self.controller = None
+        self._release_player()
+        if self.is_joycon() and self.hub.bridge is not None:
+            self.hub.bridge.joycon_disconnected()
         if self.on_topology_change is not None:
             self.on_topology_change()
         if self.hub.bridge is not None:
@@ -699,6 +879,182 @@ class Bridge:
         self._reorder_timer: Optional[threading.Timer] = None
         self._reorder_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        # Joy-Con pads: "pair" while combined, "left" / "right" while split.
+        self._joycon_pairs: dict[str, JoyConPair] = {}
+        self._joycon_pair_lock = threading.Lock()
+        self._joycon_switch_lock = threading.Lock()
+        self._joycons_split = False
+        # Pro Controller 2 headset mics by MAC: (HeadsetMic, VirtualMic).
+        self._headset_mics: dict = {}
+        self._players: dict[object, int] = {}
+        self._players_lock = threading.Lock()
+        self._extra_dsu_slots: set[int] = set()
+
+    def joycon_pair_for(self, side: Optional[str]) -> JoyConPair:
+        """The pad a Joy-Con feeds: the shared pair while combined, its own
+        sideways pad while split (see set_joycon_split). Created on first use."""
+        key = side if self._joycons_split and side is not None else "pair"
+        with self._joycon_pair_lock:
+            pair = self._joycon_pairs.get(key)
+            if pair is None:
+                button_map = (
+                    self.workers[0].config_button_map(P.PRO_CONTROLLER2_PID)
+                    if self.config.button_map
+                    else JOYCON_PAIR_BUTTON_MAP
+                )
+                pair = JoyConPair(
+                    button_map,
+                    dsu=self.dsu,
+                    sideways=self.config.joycon_single_sideways,
+                    mouse=self.config.joycon_mouse,
+                    extra_dsu_slots=(self.claim_extra_dsu_slot, self.release_extra_dsu_slot),
+                )
+                self._joycon_pairs[key] = pair
+            return pair
+
+    def set_joycon_split(self, split: bool) -> None:
+        """Split a Joy-Con pair into two independent sideways controllers, or
+        join them back, while connected. Each split Joy-Con gets its own
+        player number (lights) in the order the two connected; joined, the
+        pair takes the lowest free number. Not saved: once no Joy-Con is
+        connected they go back to pairing (see joycon_disconnected)."""
+        with self._joycon_switch_lock:
+            if split == self._joycons_split:
+                return
+            moving = sorted(
+                (w for w in self.workers if w.pair is not None and w.controller is not None),
+                key=lambda w: w.connected_at,
+            )
+            old = {id(w.pair): w.pair for w in moving}
+            for w in moving:
+                w.pair.detach(w.controller, relayout=False)
+            now = time.monotonic()
+            for pair in old.values():
+                self.release_player(pair)
+                pair.remove_stale_pad(now, 0.0)
+            self._joycons_split = split
+            new = {}
+            for w in moving:
+                pair = self.joycon_pair_for(w.joycon_side())
+                w.move_to_pair(pair, relayout=False)
+                new[id(pair)] = pair
+            for pair in new.values():
+                pair.sync_device()
+            logger.info("Joy-Cons %s", "split into separate controllers" if split else "joined into a pair")
+        self._publish_state()
+
+    def joycon_disconnected(self) -> None:
+        """Once every Joy-Con is off, a split ends: the next ones to connect
+        pair up again, like a Switch, until they're split again."""
+        with self._joycon_switch_lock:
+            if not self._joycons_split:
+                return
+            if any(w.is_joycon() and w.is_connected() for w in self.workers):
+                return
+            self._joycons_split = False
+            logger.info("all Joy-Cons off; they'll pair again when they reconnect")
+
+    def headset_mic_for(self, mac: str):
+        """The decoder feeding this Pro Controller 2's virtual microphone
+        (created on first use, kept across reconnects so apps keep their
+        input selected); None if libopus or PipeWire/pactl isn't available."""
+        from .headset_mic import HeadsetMic, VirtualMic
+
+        with self._joycon_pair_lock:
+            if mac in self._headset_mics:
+                return self._headset_mics[mac][0]
+            try:
+                n = len(self._headset_mics) + 1
+                name = "Pro Controller 2 Headset Mic" + (f" {n}" if n > 1 else "")
+                virtual = VirtualMic(f"switch2_headset_mic_{n}", name)
+                mic = HeadsetMic(virtual)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("headset mic unavailable: %s", exc)
+                return None
+            self._headset_mics[mac] = (mic, virtual)
+            return mic
+
+    def _check_headset_request(self) -> None:
+        try:
+            request = HEADSET_REQUEST_PATH.read_text().strip()
+            HEADSET_REQUEST_PATH.unlink()
+        except OSError:
+            return
+        if request in ("on", "off"):
+            threading.Thread(target=self.set_headset_mode, args=(request == "on",),
+                             name="headset-mode", daemon=True).start()
+
+    def set_headset_mode(self, on: bool) -> None:
+        """Turn Pro Controller 2 headset mode on/off (saved), switching any
+        connected Pro 2 live. If one doesn't start sending the new reports
+        within a few seconds, its link is dropped so it reconnects in the
+        right mode."""
+        self.config.pro2_headset_mic = on
+        self.config.save()
+        logger.info("headset mode %s for Pro Controller 2", "on" if on else "off")
+        for worker in list(self.workers):
+            ctrl = worker.controller
+            if ctrl is None or not ctrl.is_connected or ctrl.product_id != P.PRO_CONTROLLER2_PID:
+                continue
+            ctrl.want_extended = on
+            try:
+                switched = ctrl.set_headset_mode(on)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("live headset switch failed for %s: %s", worker.entry.mac, exc)
+                switched = False
+            if switched:
+                mic = self.headset_mic_for(worker.entry.mac) if on else None
+                ctrl.mic_callback = mic.feed if mic is not None else None
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and ctrl.last_input_at == 0.0:
+                    time.sleep(0.1)
+                if ctrl.last_input_at != 0.0:
+                    continue
+                logger.info("%s didn't switch live; reconnecting it", worker.entry.mac)
+            ctrl.close()  # the worker sees the drop; the next connect uses want_extended
+
+    def _check_joycon_request(self) -> None:
+        """Pick up a split/join written by `python -m ngc joycons ...`."""
+        try:
+            request = JOYCON_REQUEST_PATH.read_text().strip()
+            JOYCON_REQUEST_PATH.unlink()
+        except OSError:
+            return
+        if request in ("split", "join"):
+            self.set_joycon_split(request == "split")
+
+    def claim_player(self, owner) -> int:
+        """Give a connecting controller (a worker, or the Joy-Con pair) the
+        lowest free player number, like a Switch. Idempotent per owner."""
+        with self._players_lock:
+            player = self._players.get(owner)
+            if player is None:
+                used = set(self._players.values())
+                player = next((p for p in range(1, 9) if p not in used), 8)
+                self._players[owner] = player
+                logger.info("assigned P%d", player)
+        if isinstance(owner, JoyConPair):
+            owner.set_player(player)
+        return player
+
+    def release_player(self, owner) -> None:
+        with self._players_lock:
+            self._players.pop(owner, None)
+
+    def claim_extra_dsu_slot(self) -> Optional[int]:
+        """A DSU slot outside every connected player's own (player - 1),
+        highest first so it stays clear of players joining later. Used for a
+        Joy-Con pair's left-half motion; None when all four are taken."""
+        with self._players_lock:
+            used = {p - 1 for p in self._players.values()} | self._extra_dsu_slots
+            slot = next((s for s in (3, 2, 1, 0) if s not in used), None)
+            if slot is not None:
+                self._extra_dsu_slots.add(slot)
+            return slot
+
+    def release_extra_dsu_slot(self, slot: int) -> None:
+        with self._players_lock:
+            self._extra_dsu_slots.discard(slot)
 
     # Measured empty on a real NSO GameCube pad (~2939 mV before cutoff).
     BATTERY_EMPTY_MV = 2950
@@ -725,7 +1081,7 @@ class Bridge:
                 controllers.append(
                     ControllerState(
                         mac=entry.mac,
-                        player=entry.player,
+                        player=(worker.player if worker and worker.player else entry.player),
                         name=entry.name or (ctrl.name if ctrl else ""),
                         bonded=entry.bonded,
                         connected=worker.is_connected() if worker else False,
@@ -764,6 +1120,10 @@ class Bridge:
                     headline=headline,
                     detail=detail,
                     controllers=controllers,
+                    joycons_split=self._joycons_split,
+                    joycons_connected=sum(
+                        1 for w in self.workers if w.is_joycon() and w.is_connected()
+                    ),
                 )
             )
 
@@ -790,6 +1150,13 @@ class Bridge:
         while not self._stop.wait(_STATUS_INTERVAL_S):
             try:
                 self._apply_led_overrides()
+                now = time.monotonic()
+                for worker in self.workers:
+                    worker.remove_stale_pad(now)
+                for pair in list(self._joycon_pairs.values()):
+                    pair.remove_stale_pad(now, PAD_REMOVE_GRACE_S)
+                self._check_joycon_request()
+                self._check_headset_request()
                 self._publish_state()
             except Exception as exc:  # noqa: BLE001
                 logger.debug("state publish failed: %s", exc)
@@ -841,6 +1208,11 @@ class Bridge:
                 self._reorder_timer.cancel()
         for worker in self.workers:
             worker.cleanup()
+        for pair in self._joycon_pairs.values():
+            pair.close()
+        for mic, virtual in self._headset_mics.values():
+            mic.close()
+            virtual.close()
         if self.dsu is not None:
             self.dsu.stop()
         if self.hub._executor is not None:

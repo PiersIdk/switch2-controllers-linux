@@ -43,12 +43,22 @@ build_frontend() {
   fi
 }
 
+# The Decky plugin runs from a copy outside the repo, so it can't self-locate
+# ngc/ at runtime; bake this checkout's absolute path into the copy instead
+# (NGC_PROJECT_DIR still overrides it at runtime if set).
+bake_main_py() {
+  local dest_file="$1"
+  sed "s#_BAKED_PROJECT_DIR: str | None = None#_BAKED_PROJECT_DIR: str | None = \"$PROJECT_DIR\"#" \
+    "$SRC/main.py" > "$dest_file"
+}
+
 make_zip() {
   echo ">> packaging $ZIP"
   rm -f "$ZIP"
   tmp="$(mktemp -d)"
   mkdir -p "$tmp/$PLUGIN_NAME/dist"
-  cp "$SRC/main.py" "$SRC/plugin.json" "$SRC/package.json" "$tmp/$PLUGIN_NAME/"
+  bake_main_py "$tmp/$PLUGIN_NAME/main.py"
+  cp "$SRC/plugin.json" "$SRC/package.json" "$tmp/$PLUGIN_NAME/"
   cp "$SRC/dist/index.js" "$tmp/$PLUGIN_NAME/dist/"
   [[ -f "$PROJECT_DIR/LICENSE" ]] && cp "$PROJECT_DIR/LICENSE" "$tmp/$PLUGIN_NAME/"
   (cd "$tmp" && zip -qr "$ZIP" "$PLUGIN_NAME")
@@ -59,7 +69,8 @@ install_to() {
   local dest="$1/$PLUGIN_NAME"
   echo ">> installing Decky plugin -> $dest"
   mkdir -p "$dest/dist"
-  cp "$SRC/main.py" "$SRC/plugin.json" "$SRC/package.json" "$dest/"
+  bake_main_py "$dest/main.py"
+  cp "$SRC/plugin.json" "$SRC/package.json" "$dest/"
   cp "$SRC/dist/index.js" "$dest/dist/index.js"
   [[ -f "$PROJECT_DIR/LICENSE" ]] && cp "$PROJECT_DIR/LICENSE" "$dest/"
 }

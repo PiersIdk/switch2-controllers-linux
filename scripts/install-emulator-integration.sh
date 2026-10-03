@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install the emulator-integration pieces on Bazzite (run on the box, from the
-# rsynced ~/nso-gc-bazzite). Idempotent; backs up files it replaces.
+# rsynced project checkout). Idempotent; backs up files it replaces.
 #   - controller-detect script (new pad kinds + P1-P4 order)
 #   - Dolphin native GameCube profile for the NSO GameCube pad
 #   - Ryujinx Switch 2 Pro profile + CemuHook (DSU) motion wiring

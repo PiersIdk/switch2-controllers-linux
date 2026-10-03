@@ -54,6 +54,13 @@ def has_hd_rumble(pid: int) -> bool:
 def has_analog_triggers(pid: int) -> bool:
     return pid in ANALOG_TRIGGER_PIDS
 
+
+JOYCON2_PIDS = {JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID}
+
+
+def is_joycon(pid: int) -> bool:
+    return pid in JOYCON2_PIDS
+
 # --------------------------------------------------------------------------- #
 # GATT characteristic UUIDs                                                     #
 # --------------------------------------------------------------------------- #
@@ -202,6 +209,52 @@ SWITCH_BUTTONS = {
     "GR": 0x01000000,
     "GL": 0x02000000,
 }
+
+# Pro Controller 2 extended (headset) report: 112 bytes on
+# 7492866c-...-f9 once every feature bit is on (see docs/headset-audio.md).
+# Buttons are a 24-bit word at bytes 2-4, mapped to the shared names below
+# from a per-button capture; sticks at 5-7 / 8-10; mic at 13-64. The motion
+# block after it is packed (not decoded yet), so motion and battery read 0.
+EXTENDED_INPUT_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
+EXTENDED_BUTTONS = {
+    0x000001: "B", 0x000002: "A", 0x000004: "Y", 0x000008: "X",
+    0x000010: "R", 0x000020: "ZR", 0x000040: "PLUS", 0x000080: "R_STK",
+    0x000100: "DOWN", 0x000200: "RIGHT", 0x000400: "LEFT", 0x000800: "UP",
+    0x001000: "L", 0x002000: "ZL", 0x004000: "MINUS", 0x008000: "L_STK",
+    0x010000: "HOME", 0x020000: "CAPTURE", 0x040000: "GR", 0x080000: "GL",
+    0x100000: "C",
+}
+
+
+def parse_extended_report(data: bytes) -> "InputReport":
+    word = decodeu(data[2:5])
+    buttons = 0
+    for bit, name in EXTENDED_BUTTONS.items():
+        if word & bit:
+            buttons |= SWITCH_BUTTONS[name]
+    return InputReport(
+        raw=bytes(data),
+        timestamp=data[0],
+        buttons=buttons,
+        left_stick_raw=get_stick_xy(data[5:8]),
+        right_stick_raw=get_stick_xy(data[8:11]),
+        battery_mv=0,
+        accel=(0, 0, 0),
+        gyro=(0, 0, 0),
+        left_trigger_raw=0,
+        right_trigger_raw=0,
+    )
+
+
+# Which bits of the shared bitmask each Joy-Con 2 half drives (verified from
+# raw captures). Bits 29-31 are always set on both halves and carry no input,
+# so masking also strips them before two halves are OR'd into one pad.
+JOYCON_RIGHT_BUTTONS = sum(SWITCH_BUTTONS[n] for n in (
+    "Y", "X", "B", "A", "SR_R", "SL_R", "R", "ZR", "PLUS", "R_STK", "HOME", "C",
+))
+JOYCON_LEFT_BUTTONS = sum(SWITCH_BUTTONS[n] for n in (
+    "MINUS", "L_STK", "CAPTURE", "DOWN", "UP", "RIGHT", "LEFT", "SR_L", "SL_L", "L", "ZL",
+))
 
 
 # --------------------------------------------------------------------------- #

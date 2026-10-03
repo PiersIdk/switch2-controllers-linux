@@ -7,7 +7,7 @@ DESKTOP="${XDG_DATA_HOME:-$HOME/.local/share}/applications/dusklight.desktop"
 APPDIR="${DUSKLIGHT_APPDIR:-$HOME/Applications/Dusklight.AppDir}"
 
 if [ ! -f "$SHIM" ]; then
-  echo "missing $SHIM — run: ~/nso-gc-bazzite/scripts/build-ngc-evdev-shim.sh" >&2
+  echo "missing $SHIM — run scripts/build-ngc-evdev-shim.sh from your project checkout" >&2
   exit 1
 fi
 

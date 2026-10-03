@@ -80,6 +80,15 @@ class Config:
     # Disconnect and sleep the pad after this many seconds with no button presses.
     # Set to 0 to disable. Override with NGC_IDLE_SLEEP_S / NGC_IDLE_SLEEP=0.
     idle_sleep_s: float = 300.0
+    # Pro Controller 2 headset mode: switch to the extended input reports so a
+    # headset in its 3.5 mm jack shows up as a PipeWire microphone ("Pro
+    # Controller 2 Headset Mic"). Motion and battery aren't decoded in that
+    # mode yet, so it's off by default.
+    pro2_headset_mic: bool = False
+    # A lone Joy-Con (partner not connected) becomes a sideways pad.
+    joycon_single_sideways: bool = True
+    # A Joy-Con resting on a surface becomes a mouse (optical sensor).
+    joycon_mouse: bool = True
     # Legacy single-controller fields (migrated into `controllers` on load).
     controller_mac: Optional[str] = None
     player: int = 1

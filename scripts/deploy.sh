@@ -4,8 +4,8 @@
 set -euo pipefail
 
 HOST="${1:-bazzite}"
-DEST="~/nso-gc-bazzite"
 SRC="$(cd "$(dirname "$0")/.." && pwd)/"
+DEST="~/$(basename "${SRC%/}")"
 
 rsync -az --delete \
   --exclude '.venv*' \

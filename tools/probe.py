@@ -3,7 +3,7 @@
 handshake, and stream decoded input to the terminal.
 
 Run on the Bazzite box:
-    cd ~/nso-gc-bazzite && .venv/bin/python tools/probe.py
+    cd ~/switch2-controllers-linux && .venv312/bin/python tools/probe.py
 Put the controller in pairing mode first (hold the small sync button until the
 player LEDs scan back and forth).
 """
